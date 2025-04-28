@@ -2,135 +2,171 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import torch
 import torch.nn.functional as F
-from gcn_model import GCNRecommendationModel
 import pandas as pd
 import os
-from difflib import get_close_matches
+from gcn_model import load_graph_data
+from train_gcn import GCN
 
-# Flask setup
 app = Flask(__name__)
 CORS(app)
 
-# Load data
-print("Đang tải dữ liệu và mô hình...")
-data = torch.load("data/movie_graph.pt", weights_only=False)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-data = data.to(device)
+# Load dữ liệu và mô hình
 
-df = data.df
-df = df.reset_index(drop=True)
+# Load graph data
+graph_data_path = "data/movie_graph.pt"
+data = load_graph_data(graph_data_path)
 
-model = GCNRecommendationModel(
-    in_channels=data.x.shape[1],
+# Khởi tạo model
+model = GCN(
+    in_channels=data.x.size(1),
     hidden_channels=128,
-    out_channels=64
-).to(device)
-model.load_state_dict(torch.load("data/gcn_model.pth", map_location=device))
+    out_channels=64,
+    dropout=0.5
+)
+
+# Load trọng số
+model_path = "data/gcn_model.pth"
+try:
+    model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+except FileNotFoundError:
+    exit(1)
+except RuntimeError:
+    exit(1)
+
 model.eval()
 
-# khởi tạo mô hình và tính toán embedding cho tất cả các phim
+# Load DataFrame phim
+movies_path = "data/movies_df.pkl"
+try:
+    df_movies = pd.read_pickle(movies_path)
+except FileNotFoundError:
+    exit(1)
+
+# Kiểm tra độ khớp
+if len(df_movies) != data.x.size(0):
+    exit(1)
+
+# Tính embedding và ma trận tương đồng
+
 with torch.no_grad():
-    hidden_embedding = model.extract_features(data.x, data.edge_index)
-print("Khởi tạo hoàn tất!")
+    movie_embeddings = model(data.x, data.edge_index)
 
+sim_matrix = F.cosine_similarity(movie_embeddings.unsqueeze(1), movie_embeddings.unsqueeze(0), dim=2)
 
+# Hàm tiện ích
 
-def find_best_match(title, titles):
-    matches = get_close_matches(title.lower(), [t.lower() for t in titles], n=1, cutoff=0.6)
-    if matches:
-        return df[df['title'].str.lower() == matches[0]].index[0]
-    return None
-
-def recommend_by_embedding(query_vector, exclude_index=None, top_k=5):
-    similarity = F.cosine_similarity(query_vector, hidden_embedding)
-    if exclude_index is not None:
-        similarity[exclude_index] = -1
-    top_indices = similarity.topk(top_k).indices.tolist()
-    return top_indices
-
-
-@app.route('/api/recommend/by_title', methods=['POST'])
-def recommend_by_title():
-    data_json = request.json
-    title = data_json.get('title', '').strip()
-    top_k = data_json.get('top_k', 5)
-
-    index = find_best_match(title, df['title'])
-    if index is None:
-        return jsonify({"error": "Không tìm thấy phim phù hợp"}), 404
-
-    selected_movie = {
-        "title": df.iloc[index]['title'],
-        "genres": df.iloc[index]['genre_names'],
-        "rating": float(df.iloc[index]['vote_average'])
+def get_movie_info(row):
+    return {
+        "title": row['title'],
+        "image": row.get('poster_path', ""),
+        "rating": row.get('vote_average', None)
     }
 
-    indices = recommend_by_embedding(hidden_embedding[index].unsqueeze(0), exclude_index=index, top_k=top_k)
-    recommendations = [ 
-        {
-            "title": df.iloc[i]['title'],
-            "genres": df.iloc[i]['genre_names'],
-            "rating": float(df.iloc[i]['vote_average'])
-        } for i in indices
-    ]
+# Các API
 
-    return jsonify({
-        "selected_movie": selected_movie,
-        "recommendations": recommendations
-    })
+@app.route("/api/recommend/by_title", methods=["POST"])
+def recommend_by_title_api():
+    data_json = request.get_json()
+    title = data_json.get("title", "").strip()
+    top_k = data_json.get("top_k", 5)
 
-@app.route('/api/recommend/by_genre', methods=['POST'])
-def recommend_by_genre():
-    data_json = request.json
-    genres = data_json.get('genres', [])  # Expect list
-    top_k = data_json.get('top_k', 10)
+    if not title:
+        return jsonify({"error": "Missing 'title' field."}), 400
 
-    genres = [g.strip().lower() for g in genres if g.strip() != '']
-
-    if not genres:
-        return jsonify({"error": "Bạn cần nhập ít nhất 1 thể loại"}), 400
-
-    available_genres = sorted({g for genres_list in df['genre_names'] for g in genres_list})
-    matched = df[df['genre_names'].apply(lambda movie_genres: any(
-        genre in item.lower() for genre in genres for item in movie_genres
-    ))]
+    matched = df_movies[df_movies['title'].str.lower().str.contains(title.lower(), na=False)]
 
     if matched.empty:
-        close = get_close_matches(genres[0], [g.lower() for g in available_genres], n=1)
-        if close:
-            return jsonify({
-                "error": f"Không tìm thấy thể loại '{genres[0]}'",
-                "suggestion": f"Bạn có muốn thử với '{close[0]}' không?"
-            }), 404
-        else:
-            return jsonify({"error": "Không tìm thấy thể loại phù hợp"}), 404
+        return jsonify({
+            "selected_movie": None,
+            "recommendations": [],
+            "message": "Không tìm thấy phim phù hợp với tên đã nhập."
+        })
 
-    indices = matched.index.tolist()
-    query_vec = hidden_embedding[indices].mean(dim=0).unsqueeze(0)
-    rec_indices = recommend_by_embedding(query_vec, top_k=top_k)
+    movie_idx = matched.index[0]
+    node_idx = (data.node_to_movie_idx == movie_idx).nonzero(as_tuple=True)[0].item()
 
-    recommendations = [ 
-        {
-            "title": df.iloc[i]['title'],
-            "genres": df.iloc[i]['genre_names'],
-            "rating": float(df.iloc[i]['vote_average'])
-        } for i in rec_indices
-    ]
+    sims = sim_matrix[node_idx]
+    top_indices = torch.topk(sims, top_k + 1).indices.tolist()
+    top_indices = [i for i in top_indices if i != node_idx][:top_k]
+
+    df_indices = [data.node_to_movie_idx[i].item() for i in top_indices]
+    recommendations = df_movies.iloc[df_indices]
 
     return jsonify({
-        "recommendations": recommendations
+        "selected_movie": get_movie_info(df_movies.iloc[movie_idx]),
+        "recommendations": [get_movie_info(row) for _, row in recommendations.iterrows()]
     })
 
-@app.route('/api/genres', methods=['GET'])
-def get_all_genres():
-    genres = sorted({g for genres in df['genre_names'] for g in genres})
-    return jsonify({"genres": genres})
 
-@app.route('/api/movies', methods=['GET'])
-def get_all_movies():
-    movies = [{"title": row['title'], "genres": row['genre_names']} for _, row in df.iterrows()]
-    return jsonify({"movies": movies})
+@app.route("/api/recommend/by_genre", methods=["POST"])
+def recommend_by_genre_api():
+    data_json = request.get_json()
+    genres = data_json.get("genres", [])
+    top_k = data_json.get("top_k", 5)
+
+    if not genres or not isinstance(genres, list):
+        return jsonify({"error": "Missing or invalid 'genres' field."}), 400
+
+    filtered = df_movies[df_movies['genres'].apply(
+        lambda x: any(g.lower() in [genre.lower() for genre in x] for g in genres)
+    )]
+
+    if filtered.empty:
+        return jsonify({
+            "recommendations": [],
+            "message": "Không tìm thấy phim phù hợp với thể loại đã chọn."
+        })
+
+    node_indices = [(data.node_to_movie_idx == idx).nonzero(as_tuple=True)[0].item() for idx in filtered.index.tolist()]
+    genre_embedding = movie_embeddings[node_indices].mean(dim=0)
+
+    sims = F.cosine_similarity(genre_embedding.unsqueeze(0), movie_embeddings)
+    top_indices = torch.topk(sims, top_k).indices.tolist()
+
+    df_indices = [data.node_to_movie_idx[i].item() for i in top_indices]
+    recommendations = df_movies.iloc[df_indices]
+
+    return jsonify({
+        "recommendations": [get_movie_info(row) for _, row in recommendations.iterrows()]
+    })
 
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+@app.route("/api/recommend/by_history", methods=["POST"])
+def recommend_by_history_api():
+    data_json = request.get_json()
+    watched_titles = data_json.get("watched_titles", [])
+    top_k = data_json.get("top_k", 5)
+
+    if not watched_titles or not isinstance(watched_titles, list):
+        return jsonify({"error": "Missing or invalid 'watched_titles' field."}), 400
+
+    matched_indices = []
+    for title in watched_titles:
+        matched = df_movies[df_movies['title'].str.lower().str.contains(title.lower(), na=False)]
+        if not matched.empty:
+            movie_idx = matched.index[0]
+            node_idx = (data.node_to_movie_idx == movie_idx).nonzero(as_tuple=True)[0].item()
+            matched_indices.append(node_idx)
+
+    if not matched_indices:
+        return jsonify({
+            "recommendations": [],
+            "message": "Không tìm thấy phim nào từ lịch sử đã xem."
+        })
+
+    history_embedding = movie_embeddings[matched_indices].mean(dim=0)
+
+    sims = F.cosine_similarity(history_embedding.unsqueeze(0), movie_embeddings)
+    top_indices = torch.topk(sims, top_k).indices.tolist()
+
+    df_indices = [data.node_to_movie_idx[i].item() for i in top_indices]
+    recommendations = df_movies.iloc[df_indices]
+
+    return jsonify({
+        "recommendations": [get_movie_info(row) for _, row in recommendations.iterrows()]
+    })
+
+
+# Run server
+if __name__ == "__main__":
+    app.run(debug=True, use_reloader=False, host="0.0.0.0", port=5000)

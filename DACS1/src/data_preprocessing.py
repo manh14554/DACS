@@ -6,42 +6,91 @@ import torch
 import os
 
 def load_data_from_csv(csv_path):
-    df = pd.read_csv(csv_path)
-    return df
+    """Tải dữ liệu từ file CSV."""
+    try:
+        df = pd.read_csv(csv_path)
+        print(f"Đã tải thành công dữ liệu từ {csv_path}. Số lượng phim: {len(df)}")
+        return df
+    except FileNotFoundError:
+        print(f"Không tìm thấy file tại {csv_path}. Vui lòng kiểm tra đường dẫn.")
+        exit(1)
 
 def process_genres(df):
-    # Chuyển cột genres từ chuỗi thành list các thể loại
-    df['genres'] = df['genres'].fillna("").apply(lambda x: [genre.strip() for genre in x.split(',') if genre.strip()])
+    """Chuyển cột genres từ chuỗi JSON thành list các thể loại."""
+    def parse_genres(genre_str):
+        try:
+            # Parse chuỗi JSON thành list các dictionary
+            genres_list = ast.literal_eval(genre_str)
+            return [genre['name'].strip() for genre in genres_list if genre.get('name')]
+        except (ValueError, SyntaxError, TypeError):
+            return []
+
+    # Áp dụng parse cho cột genres
+    df['genres'] = df['genres'].fillna("[]").apply(parse_genres)
+    # Loại bỏ các hàng không có thể loại
+    df = df[df['genres'].apply(lambda x: len(x) > 0)]
+    print(f"Số lượng phim sau khi xử lý genres: {len(df)}")
     return df
 
 def encode_genres(df):
-    mlb = MultiLabelBinarizer() # mlb là MultiLabelBinarizer để mã hóa nhiều nhãn
-    genre_encoded = mlb.fit_transform(df['genres'])# Chuyển đổi genres thành các nhãn nhị phân
-    genre_tensor = torch.tensor(genre_encoded, dtype=torch.float)# Chuyển đổi thành tensor PyTorch 
+    """Mã hóa các thể loại thành tensor nhị phân."""
+    mlb = MultiLabelBinarizer()
+    genre_encoded = mlb.fit_transform(df['genres'])
+    genre_tensor = torch.tensor(genre_encoded, dtype=torch.float)
+    print(f"Kích thước genre_tensor: {genre_tensor.shape}")
     return genre_tensor, mlb.classes_
 
-def encode_titles(df, model_name='sentence-transformers/all-MiniLM-L6-v2'):# Chọn mô hình SentenceTransformer
-    model = SentenceTransformer(model_name)# Tải mô hình
-    embeddings = model.encode(df['title'].astype(str).tolist(), convert_to_tensor=True)# Chuyển đổi tiêu đề thành tensor
+def encode_titles(df, model_name='sentence-transformers/all-MiniLM-L6-v2'):
+    """Chuyển đổi tiêu đề thành tensor embedding."""
+    model = SentenceTransformer(model_name)
+    # Đảm bảo cột title không có giá trị NaN
+    titles = df['title'].fillna("").astype(str).tolist()
+    embeddings = model.encode(titles, convert_to_tensor=True)
+    print(f"Kích thước title_embeddings: {embeddings.shape}")
     return embeddings
 
-def concatenate_features(genre_tensor, title_embeddings):# Nối các đặc trưng lại với nhau
-    return torch.cat((genre_tensor, title_embeddings), dim=1)# Nối genre_tensor và title_embeddings theo chiều 1 (cột)
+def concatenate_features(genre_tensor, title_embeddings):
+    """Nối các đặc trưng thành một tensor duy nhất."""
+    # Đảm bảo số lượng hàng của genre_tensor và title_embeddings khớp nhau
+    if genre_tensor.shape[0] != title_embeddings.shape[0]:
+        raise ValueError("Số lượng phim không khớp giữa genre_tensor và title_embeddings.")
+    features = torch.cat((genre_tensor, title_embeddings), dim=1)
+    print(f"Kích thước features sau khi nối: {features.shape}")
+    return features
 
-def preprocess(csv_path):# Chức năng chính để xử lý dữ liệu
+def preprocess(csv_path):
+    """Chức năng chính để xử lý dữ liệu."""
+    # Tải dữ liệu
     df = load_data_from_csv(csv_path)
-    df = process_genres(df)  # <-- Thêm dòng này để xử lý genres trước khi encode
-    genre_tensor, genre_classes = encode_genres(df)# Chuyển đổi genres thành tensor
-    title_embeddings = encode_titles(df)# Chuyển đổi tiêu đề thành tensor
-    features = concatenate_features(genre_tensor, title_embeddings)# Nối các đặc trưng lại với nhau
+    
+    # Loại bỏ các hàng không có tiêu đề
+    df = df.dropna(subset=['title'])
+    print(f"Số lượng phim sau khi loại bỏ title NaN: {len(df)}")
+    
+    # Xử lý cột genres
+    df = process_genres(df)
+    
+    # Mã hóa genres và titles
+    genre_tensor, genre_classes = encode_genres(df)
+    title_embeddings = encode_titles(df)
+    
+    # Nối các đặc trưng
+    features = concatenate_features(genre_tensor, title_embeddings)
+    
+    return df, features, genre_classes
 
 if __name__ == "__main__":
     output_dir = "data"
     os.makedirs(output_dir, exist_ok=True)
 
-    df, features, genre_classes = preprocess("../data/TMDB_movie_dataset_v11.csv")
+    # Điều chỉnh đường dẫn để phù hợp với vị trí file
+    df, features, genre_classes = preprocess("../datas/tmdb_5000_movies.csv")
 
+    # Lưu kết quả
     torch.save(features, os.path.join(output_dir, "features.pt"))
     df.to_pickle(os.path.join(output_dir, "movies_df.pkl"))
+    # Lưu danh sách thể loại để sử dụng sau này nếu cần
+    with open(os.path.join(output_dir, "genre_classes.txt"), "w") as f:
+        f.write("\n".join(genre_classes))
 
     print("Đã xử lý và lưu xong dữ liệu.")
