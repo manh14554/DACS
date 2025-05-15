@@ -76,7 +76,7 @@ if __name__ == "__main__":
     os.makedirs(output_dir, exist_ok=True)
 
     # Xử lý dữ liệu
-    df, features, genre_classes = preprocess("../datas/tmdb_5000_movies.csv", device=device)
+    df, features, genre_classes = preprocess("../datas/TMDB_movie_dataset_v11.csv", device=device)
 
     # Lưu kết quả
     torch.save(features, os.path.join(output_dir, "features.pt"))
