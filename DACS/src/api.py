@@ -92,18 +92,25 @@ def recommend_by_title_api():
             "message": "Không tìm thấy phim phù hợp với tên đã nhập."
         })
 
-    movie_idx = matched.index[0]
-    node_idx = (data.node_to_movie_idx == movie_idx).nonzero(as_tuple=True)[0].item()
+    try:
+        movie_idx = matched.index[0]
+        node_idx_arr = (data.node_to_movie_idx == movie_idx).nonzero(as_tuple=True)[0]
+        if len(node_idx_arr) == 0:
+            return jsonify({"error": "Không tìm thấy node tương ứng với phim."}), 500
+        node_idx = node_idx_arr.item()
 
-    top_indices = get_top_k_similar(movie_embeddings[node_idx], movie_embeddings, top_k, exclude_idx=node_idx)
+        top_indices = get_top_k_similar(movie_embeddings[node_idx], movie_embeddings, top_k, exclude_idx=node_idx)
+        df_indices = [data.node_to_movie_idx[i].item() for i in top_indices]
+        # Lọc chỉ số hợp lệ
+        valid_indices = [idx for idx in df_indices if idx in df_movies.index]
+        recommendations = df_movies.loc[valid_indices]
 
-    df_indices = [data.node_to_movie_idx[i].item() for i in top_indices]
-    recommendations = df_movies.iloc[df_indices]
-
-    return jsonify({
-        "selected_movie": get_movie_info(df_movies.iloc[movie_idx]),
-        "recommendations": [get_movie_info(row) for _, row in recommendations.iterrows()]
-    })
+        return jsonify({
+            "selected_movie": get_movie_info(df_movies.iloc[movie_idx]),
+            "recommendations": [get_movie_info(row) for _, row in recommendations.iterrows()]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/recommend/by_genre", methods=["POST"])
@@ -130,7 +137,9 @@ def recommend_by_genre_api():
 
     top_indices = get_top_k_similar(genre_embedding, movie_embeddings, top_k)
     df_indices = [data.node_to_movie_idx[i].item() for i in top_indices]
-    recommendations = df_movies.iloc[df_indices]
+    # Lọc chỉ số hợp lệ
+    valid_indices = [idx for idx in df_indices if idx in df_movies.index]
+    recommendations = df_movies.loc[valid_indices]
 
     return jsonify({
         "recommendations": [get_movie_info(row) for _, row in recommendations.iterrows()]
